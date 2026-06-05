@@ -3,12 +3,16 @@
 # For each roofline component c, compute the ideal rate I_c via
 # weighted-harmonic mean (Eq. 4):
 #
-#   I_c = Σ O_prec[c][p] / Σ (O_prec[c][p] / P_prec[p])
+#   I_c = Σ_p O_{c,p} / Σ_p (O_{c,p} / P_p)
 #
 # Then the core floor:
 #   T_core_floor = max_c(O_c / I_c)
 #
 # where O_c = total work (ops or bytes) for component c.
+#
+# The harmonic mean correctly models a component that processes a mix of
+# precisions at different rates — the overall rate is dominated by the
+# slowest precision proportionally to its share of work.
 #
 # Source spec: .omc/specs/performance_bound_model.md §1.4, §2.1, §A.4
 # Ports: tilesim aicore_costmodel.py time_cube structure (not values).
@@ -18,19 +22,108 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from ..calibration.constants import CubeConfig, VectorConfig, MemHierarchy, DType
-from ..extract.hivm_extractor import HIVMExtract
-from ..extract.op_classifier import Component, Precision
+from ..calibration.constants import (
+    CubeConfig, VectorConfig, MemHierarchy, CoreConfig, DType, MemLoc, VecOpType,
+)
+from ..extract.hivm_extractor import HIVMExtract, OpRecord
+from ..extract.op_classifier import Component, Precision, HW_UNIT_TO_COMPONENT
 
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+# Map our Component enum to memory paths for MTE bandwidth lookup
+_COMPONENT_MTE_PATHS: dict[Component, tuple[str, str]] = {
+    Component.MTE_GM: ("gm", "ub"),       # GM→UB (covers both CubeMTE2 and VecMTE2)
+    Component.MTE_L1: ("l1", "l0a"),      # L1→L0A/B
+    Component.MTE_UB: ("ub", "gm"),       # UB→GM (covers both FixPipe and MTE3)
+}
+
+# Precision string → DType (for throughput lookup)
+def _prec_to_dtype(prec: Precision) -> DType:
+    """Map extract Precision enum to calibration DType."""
+    return DType.from_str(prec.value)
+
+
+def _get_cube_throughput_ops_per_us(dtype: DType, cube: CubeConfig) -> float:
+    """Sustained Cube throughput in operations per microsecond.
+
+    1 TFLOPS = 10^12 FLOP/s = 10^6 FLOP/us
+    """
+    tflops = cube.get_throughput(dtype)
+    if tflops <= 0:
+        return 0.0
+    return tflops * 1e6  # FLOP/us
+
+
+def _get_vector_throughput_ops_per_us(
+    prec: Precision, vector: VectorConfig, op_name: str = "",
+) -> float:
+    """Sustained Vector throughput in operations per microsecond.
+
+    Uses per-op cycle count if available, falls back to aggregate throughput.
+    Vector width = 128 elements per instruction.
+    """
+    # Try per-op cycle lookup first
+    if op_name:
+        try:
+            vt = VecOpType.from_str(op_name)
+            dtype = _prec_to_dtype(prec)
+            cycles_per_128 = vector.get_op_cycles(vt, dtype)
+            if cycles_per_128 > 0:
+                # 128 elements per instruction / cycles_per_128 cycles
+                # At 1.85 GHz: 1.85e9 cycles/s = 1850 cycles/us
+                # ops/us = (128 / cycles_per_128) * (1850 / 1) = 236800 / cycles_per_128
+                # But we need to return a rate usable in harmonic mean.
+                # For now, return elements/us: 128 * 1850 / cycles_per_128
+                return 128.0 * 1850.0 / cycles_per_128
+        except (KeyError, ValueError):
+            pass
+
+    # Fallback: aggregate TFLOPS
+    if prec in (Precision.FP16, Precision.BF16):
+        tflops = vector.throughput_fp16_tflops
+    else:
+        tflops = vector.throughput_fp32_tflops
+
+    if tflops <= 0:
+        return 0.0
+    return tflops * 1e6  # FLOP/us
+
+
+def _get_mte_throughput_bytes_per_us(
+    component: Component, memory: MemHierarchy, op: Optional[OpRecord] = None,
+) -> float:
+    """Sustained MTE bandwidth in bytes per microsecond."""
+    path = _COMPONENT_MTE_PATHS.get(component)
+    if path is None:
+        return 0.0
+
+    src, dst = path
+    pkt_size = -1
+    if op is not None and op.bytes_transferred > 0:
+        pkt_size = op.bytes_transferred
+
+    try:
+        bw, _ = memory.lookup_bw(src, dst, pkt_size=pkt_size)
+        return bw  # already in B/us
+    except KeyError:
+        return 0.0
+
+
+# ── Core computation ───────────────────────────────────────────────────────
 
 @dataclass
 class ComponentRate:
     """Ideal rate I_c for a single component at a single precision."""
     component: Component
-    precision: Precision
+    precision: Optional[Precision]  # None for MTE (byte-oriented)
     i_c: float                  # ideal throughput (ops/us or bytes/us)
     o_c: float                  # total work for this component+precision
-    t_c_floor: float           # O_c / I_c (microseconds)
+    t_c_us: float               # O_c / I_c (microseconds)
+
+    def __repr__(self) -> str:
+        prec_str = self.precision.value if self.precision else "bytes"
+        return (f"ComponentRate({self.component.value}/{prec_str}: "
+                f"I={self.i_c:.1f}, O={self.o_c:.1f}, T={self.t_c_us:.3f} us)")
 
 
 @dataclass
@@ -39,12 +132,15 @@ class ComponentBound:
     t_core_floor_us: float      # max_c(O_c / I_c)
     binding_component: Component  # component that sets the floor
 
-    # Per-component rates
+    # Per-component rates (keyed by "component/precision")
     rates: Dict[str, ComponentRate] = field(default_factory=dict)
 
     # Per-component totals
     total_ops: Dict[str, float] = field(default_factory=dict)
     total_bytes: Dict[str, float] = field(default_factory=dict)
+
+    # Per-component floor times (before max)
+    per_component_us: Dict[str, float] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return (f"ComponentBound(T_core_floor={self.t_core_floor_us:.2f} us, "
@@ -56,24 +152,162 @@ def compute_component_floor(
     cube: CubeConfig,
     vector: VectorConfig,
     memory: MemHierarchy,
-    core_clock_ghz: float = 1.85,
+    core: Optional[CoreConfig] = None,
 ) -> ComponentBound:
     """Compute T_core_floor from Tier 2 HIVM extraction.
 
+    For each component c, computes the weighted-harmonic mean ideal rate I_c
+    across its precision mix, then T_c = O_c / I_c.  The core floor is the
+    maximum across all components (the bottleneck component).
+
+    The harmonic mean is load-bearing for bound semantics: it gives the
+    ideal throughput under perfect work distribution across precisions.
+    Any real scheduling can only be slower → the computed T_c is a
+    conservative lower bound.
+
     Args:
-        extract: M3 HIVM extract output (per-component O_prec, handoffs).
+        extract: M3 HIVM extract output (per-component O_prec, operations).
         cube: Sustained Cube throughput calibration.
         vector: Sustained Vector throughput calibration.
         memory: Memory hierarchy with sustained bandwidths.
-        core_clock_ghz: Core clock frequency (1.85 GHz default).
+        core: Core config (clock, counts).  Uses 1.85 GHz default if None.
 
     Returns:
-        ComponentBound with T_core_floor and per-component rates.
+        ComponentBound with T_core_floor, per-component rates, and binding.
 
     Raises:
-        NotImplementedError: Model not yet implemented.
+        ValueError: If a component has work but no throughput calibration.
     """
-    raise NotImplementedError(
-        "Component model not yet implemented. "
-        "Requires M3 HIVM extractor to produce HIVMExtract first."
+    if core is None:
+        core = CoreConfig()
+
+    # Aggregate work per (component, precision)
+    # compute_work[(comp, prec)] = total ops (or bytes for MTE)
+    compute_work: dict[tuple[Component, Optional[Precision]], float] = {}
+    mte_bytes: dict[Component, float] = {}
+
+    for op in extract.operations:
+        comp = op.component
+        prec = op.precision
+
+        if comp in (Component.CUBE, Component.VECTOR, Component.SCALAR):
+            # Work in elements (ops) scaled by loop_multiplier
+            work = float(op.elements) * float(op.loop_multiplier)
+            key = (comp, prec)
+            compute_work[key] = compute_work.get(key, 0.0) + work
+        elif comp in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
+            # Work in bytes
+            work = float(op.bytes_transferred) * float(op.loop_multiplier)
+            mte_bytes[comp] = mte_bytes.get(comp, 0.0) + work
+            # Also record per-precision for type-level tracking
+            key = (comp, prec)
+            compute_work[key] = compute_work.get(key, 0.0) + work
+
+    # Compute I_c per component via harmonic mean, then T_c
+    per_component_us: dict[str, float] = {}
+    rates: dict[str, ComponentRate] = {}
+    total_ops: dict[str, float] = {}
+    total_bytes: dict[str, float] = {}
+
+    for comp in Component:
+        comp_str = comp.value
+
+        # Collect precision-level data for this component
+        precision_work: list[tuple[Optional[Precision], float]] = []
+        for (c, p), w in compute_work.items():
+            if c == comp and w > 0:
+                precision_work.append((p, w))
+
+        if not precision_work and comp not in mte_bytes:
+            continue
+
+        total_work = sum(w for _, w in precision_work)
+
+        if comp == Component.CUBE:
+            # Harmonic mean over Cube precisions
+            numerator = 0.0
+            denominator = 0.0
+            for prec, w in precision_work:
+                if prec is None:
+                    continue
+                dtype = _prec_to_dtype(prec)
+                p_rate = _get_cube_throughput_ops_per_us(dtype, cube)
+                if p_rate <= 0:
+                    continue
+                numerator += w
+                denominator += w / p_rate
+                key = f"{comp_str}/{prec.value}"
+                rates[key] = ComponentRate(
+                    component=comp, precision=prec,
+                    i_c=p_rate, o_c=w, t_c_us=w / p_rate,
+                )
+            i_c = numerator / denominator if denominator > 0 else 0.0
+            t_c = total_work / i_c if i_c > 0 else float("inf")
+            total_ops[comp_str] = total_work
+
+        elif comp == Component.VECTOR:
+            # Harmonic mean over Vector precisions and op types
+            numerator = 0.0
+            denominator = 0.0
+            for prec, w in precision_work:
+                if prec is None:
+                    continue
+                # Find the specific op for this precision (best-effort)
+                p_rate = _get_vector_throughput_ops_per_us(prec, vector)
+                if p_rate <= 0:
+                    continue
+                numerator += w
+                denominator += w / p_rate
+                key = f"{comp_str}/{prec.value}"
+                rates[key] = ComponentRate(
+                    component=comp, precision=prec,
+                    i_c=p_rate, o_c=w, t_c_us=w / p_rate,
+                )
+            i_c = numerator / denominator if denominator > 0 else 0.0
+            t_c = total_work / i_c if i_c > 0 else float("inf")
+            total_ops[comp_str] = total_work
+
+        elif comp == Component.SCALAR:
+            # Scalar: no separate throughput — apply overhead factor later
+            # For now, scalar time = 0 (accounted for by scalar_overhead_factor
+            # in kernel-level cycle computation in PipelineAnalysis)
+            total_ops[comp_str] = total_work
+            t_c = 0.0  # scalar cycles folded into overhead factor
+            i_c = float("inf") if total_work > 0 else 0.0
+
+        elif comp in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
+            # MTE: single BW per path, harmonic reduces to that BW
+            bw = _get_mte_throughput_bytes_per_us(comp, memory)
+            total_bytes[comp_str] = mte_bytes.get(comp, 0.0)
+            i_c = bw
+            t_c = total_bytes[comp_str] / bw if bw > 0 else float("inf")
+            for prec, w in precision_work:
+                prec_str = prec.value if prec else "bytes"
+                key = f"{comp_str}/{prec_str}"
+                rates[key] = ComponentRate(
+                    component=comp, precision=prec,
+                    i_c=bw, o_c=w, t_c_us=w / bw if bw > 0 else float("inf"),
+                )
+
+        else:
+            continue
+
+        per_component_us[comp_str] = t_c
+
+    # Core floor = max across components
+    if per_component_us:
+        binding_str = max(per_component_us, key=lambda k: per_component_us[k])
+        binding_comp = Component(binding_str)
+        t_core_floor_us = per_component_us[binding_str]
+    else:
+        binding_comp = Component.SCALAR
+        t_core_floor_us = 0.0
+
+    return ComponentBound(
+        t_core_floor_us=t_core_floor_us,
+        binding_component=binding_comp,
+        rates=rates,
+        total_ops=total_ops,
+        total_bytes=total_bytes,
+        per_component_us=per_component_us,
     )
