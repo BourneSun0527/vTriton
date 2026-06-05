@@ -64,6 +64,9 @@ struct HIVMOp {
   int lineNumber = 0;
   bool isSyncOp = false;
   bool isBarrier = false;
+  std::string srcSpace;  // e.g. "gm", "ub", "l1", "l0a", "l0b", "l0c"
+  std::string dstSpace;  // destination memory space for transfer ops
+  std::string elemType;  // element type: "f16", "bf16", "f32", "i32", etc.
   std::vector<std::string> readBuffers;
   std::vector<std::string> writeBuffers;
   std::vector<int64_t> readBufferVersions;

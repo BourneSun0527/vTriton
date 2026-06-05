@@ -371,6 +371,43 @@ void PipelineScheduler::printUtilizationReport(llvm::raw_ostream &os) const {
   os << "\n";
 }
 
+void PipelineScheduler::emitDependencyGraphJSON(llvm::raw_ostream &os) const {
+  auto joinIntVec = [](const llvm::SmallVector<int64_t, 4> &v) {
+    std::string s;
+    llvm::raw_string_ostream ss(s);
+    ss << "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i) ss << ",";
+      ss << v[i];
+    }
+    ss << "]";
+    ss.flush();
+    return s;
+  };
+
+  os << "{\n";
+  os << "  \"operations\": [\n";
+  for (size_t i = 0; i < operations.size(); ++i) {
+    const PipelineOp &op = operations[i];
+    if (i) os << ",\n";
+    os << "    {"
+       << "\"id\":" << op.opId
+       << ",\"op_name\":\"" << op.opName << "\""
+       << ",\"hw_unit\":\"" << stringifyHWUnit(op.hwUnit).str() << "\""
+       << ",\"duration\":" << op.duration
+       << ",\"start_cycle\":" << op.startCycle
+       << ",\"end_cycle\":" << op.endCycle
+       << ",\"bytes\":" << op.bytes
+       << ",\"flops\":" << op.flops
+       << ",\"loop_multiplier\":" << op.loopMultiplier
+       << ",\"depends_on\":" << joinIntVec(op.dependsOn)
+       << "}";
+  }
+  os << "\n  ],\n";
+  os << "  \"total_cycles\":" << totalCycles << "\n";
+  os << "}\n";
+}
+
 //===----------------------------------------------------------------------===//
 // PerformanceReport Implementation
 //===----------------------------------------------------------------------===//

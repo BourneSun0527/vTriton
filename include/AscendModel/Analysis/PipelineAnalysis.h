@@ -170,6 +170,12 @@ public:
   
   /// Print utilization report.
   void printUtilizationReport(llvm::raw_ostream &os) const;
+
+  /// Emit the per-operation dependency graph as JSON for downstream consumers
+  /// (e.g. perfbound/model/serialization.py mandatory/avoidable split).
+  /// Each operation includes: id, hw_unit, op_name, bytes, flops, duration,
+  /// loop_multiplier, depends_on (producer op IDs), start_cycle, end_cycle.
+  void emitDependencyGraphJSON(llvm::raw_ostream &os) const;
   
 private:
   const HardwareConfig *hwConfig;

@@ -405,6 +405,28 @@ static int64_t getTypeByteWidth(mlir::Type type) {
   return 0;
 }
 
+/// Get the human-readable element type name from an MLIR type.
+/// Returns "" if the type cannot be classified.
+static std::string getElementTypeName(mlir::Type type) {
+  auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
+  mlir::Type elemTy = shaped ? shaped.getElementType() : type;
+  if (!elemTy)
+    return "";
+  if (auto floatTy = llvm::dyn_cast<mlir::FloatType>(elemTy)) {
+    if (floatTy.isBF16())
+      return "bf16";
+    switch (floatTy.getWidth()) {
+    case 16: return "f16";
+    case 32: return "f32";
+    case 64: return "f64";
+    default: return "";
+    }
+  }
+  if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(elemTy))
+    return ("i" + llvm::Twine(intTy.getWidth())).str();
+  return "";
+}
+
 static int64_t getShapedTypeElementCount(mlir::Type type) {
   auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
   if (!shaped || !shaped.hasStaticShape())
@@ -2101,6 +2123,46 @@ static void analyzeParsedOperation(mlir::Operation *op, int64_t loopMultiplier,
       parsed.op.bytes = parseMemRefBytes(parsed.op.text);
     if (parsed.op.elements == 0)
       parsed.op.elements = parseMemRefElementCount(parsed.op.text);
+#ifdef TRITONSIM_HAS_BISHENGIR_HIVM
+    // Extract src/dst memory spaces from MLIR operand/result types.
+    {
+      llvm::StringRef name = parsed.op.opName;
+      if (name == "load" && op->getNumOperands() >= 1) {
+        parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        if (op->getNumOperands() >= 2)
+          parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getOperand(1).getType());
+        else if (op->getNumResults() > 0)
+          parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getResult(0).getType());
+      } else if (name == "store" && op->getNumOperands() >= 2) {
+        parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getOperand(1).getType());
+      } else if (name == "copy" && op->getNumOperands() >= 2) {
+        parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getOperand(1).getType());
+      } else if (name == "fixpipe" && op->getNumOperands() >= 1) {
+        parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        if (op->getNumOperands() >= 2)
+          parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getOperand(1).getType());
+      } else if ((name == "nd2nz" || name == "nz2nd") && op->getNumOperands() >= 2) {
+        parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getOperand(1).getType());
+      } else if (isCubeOpName(name)) {
+        if (op->getNumOperands() >= 1)
+          parsed.op.srcSpace = getCanonicalTypeAddressSpace(op->getOperand(0).getType());
+        if (op->getNumResults() > 0)
+          parsed.op.dstSpace = getCanonicalTypeAddressSpace(op->getResult(0).getType());
+      }
+    }
+#endif
+    // Extract element type from MLIR result or operand type.
+    {
+      mlir::Type ty;
+      if (op->getNumResults() > 0)
+        ty = op->getResult(0).getType();
+      else if (op->getNumOperands() > 0)
+        ty = op->getOperand(0).getType();
+      parsed.op.elemType = getElementTypeName(ty);
+    }
     attachSyncMetadata(parsed);
     attachBufferAccessMetadata(op, parsed, state);
     parsed.op.duration = estimateDuration(parsed, config);
@@ -2967,6 +3029,9 @@ void HIVMAnalysisReport::emitPerfettoTrace(llvm::raw_ostream &os,
        << ",\"core_type\":\"" << op.coreType << "\""
        << ",\"sync\":" << (op.isSyncOp ? "true" : "false")
        << ",\"barrier\":" << (op.isBarrier ? "true" : "false")
+       << ",\"src_space\":\"" << op.srcSpace << "\""
+       << ",\"dst_space\":\"" << op.dstSpace << "\""
+       << ",\"elem_type\":\"" << op.elemType << "\""
        << "}}";
   }
 
@@ -3094,6 +3159,9 @@ void HIVMAnalysisReport::emitDESGraph(llvm::raw_ostream &os,
        << ",\"write_buffers\":" << joinStrVec(op.writeBuffers)
        << ",\"read_versions\":" << joinIntVec(op.readBufferVersions)
        << ",\"write_versions\":" << joinIntVec(op.writeBufferVersions)
+       << ",\"src_space\":\"" << op.srcSpace << "\""
+       << ",\"dst_space\":\"" << op.dstSpace << "\""
+       << ",\"elem_type\":\"" << op.elemType << "\""
        << "}";
   }
   os << "\n  ]\n}\n";
