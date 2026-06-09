@@ -210,8 +210,8 @@ def bound_from_extract(
         BoundResult with T_bound and decomposed floors.
     """
     from ..calibration.calib_loader import load_default_calib_db
-    from ..model.component_model import compute_component_floor_from_db
-    from ..model.grid_model import GridBound
+    from ..model.bounds import compute_bounds
+    from ..extract.dsl_extractor import GridInfo
 
     if calib_db is None:
         try:
@@ -220,44 +220,54 @@ def bound_from_extract(
             calib_db = None
 
     if calib_db is not None:
-        comp = compute_component_floor_from_db(extract, calib_db)
-        mandatory_cycles = calib_db.mandatory_handoff_cycles
-        clock_ghz = calib_db.core.clock_freq_ghz
-        try:
-            i_binding, _ = calib_db.memory.lookup_bw("gm", "ub")
-        except KeyError:
-            i_binding = 1.0
+        # Route through compute_bounds: picks i_binding and total_work
+        # consistently (memory-bound or compute-bound) from the binding component.
+        grid_info = GridInfo(
+            grid_dims=(n_cores,),
+            total_programs=n_cores,
+            tile_assignment={},
+            work={},
+            occupancy=occupancy,
+            load_balance=load_balance,
+            redundancy=1.0,
+            busiest_core_id=0,
+        )
+        pieces = compute_bounds(grid_info, extract, calib_db)
+        grid = pieces.grid
+        comp = pieces.component
+        serial = pieces.serial
     else:
+        # No calibration: fall back to defaults (zero rates → inf times)
         from ..calibration.constants import CubeConfig, VectorConfig, MemHierarchy, CoreConfig
+        from ..model.component_model import compute_component_floor
+        from ..model.grid_model import compute_grid_floor
+
+        core = CoreConfig()
         comp = compute_component_floor(
             extract,
-            CubeConfig(), VectorConfig(), MemHierarchy(), CoreConfig(),
+            CubeConfig(), VectorConfig(), MemHierarchy(), core,
         )
-        mandatory_cycles = 0.0
-        clock_ghz = 1.85
-        i_binding = 1.0
 
-    total_bytes = sum(
-        float(op.bytes_transferred) * float(op.loop_multiplier)
-        for op in extract.operations
-    )
-    total_work = max(total_bytes, 1.0)
-    grid = GridBound(
-        t_grid_floor_us=total_work / (n_cores * occupancy * load_balance * i_binding),
-        total_work=total_work,
-        n_cores=n_cores,
-        occupancy=occupancy,
-        load_balance=load_balance,
-        redundancy=1.0,
-        i_binding=i_binding,
-        busiest_core_id=0,
-    )
-
-    serial = classify_handoffs(
-        extract.handoffs,
-        mandatory_handoff_cycles=mandatory_cycles,
-        clock_ghz=clock_ghz,
-    )
+        total_bytes = sum(
+            float(op.bytes_transferred) * float(op.loop_multiplier)
+            for op in extract.operations
+        )
+        grid_info = GridInfo(
+            grid_dims=(n_cores,),
+            total_programs=n_cores,
+            tile_assignment={},
+            work={},
+            occupancy=occupancy,
+            load_balance=load_balance,
+            redundancy=1.0,
+            busiest_core_id=0,
+        )
+        grid = compute_grid_floor(grid_info, core, 1.0, max(total_bytes, 1.0))
+        serial = classify_handoffs(
+            extract.handoffs,
+            mandatory_handoff_cycles=0.0,
+            clock_ghz=1.85,
+        )
 
     return combine(grid, comp, serial, kernel_name=kernel_name, extract=extract)
 

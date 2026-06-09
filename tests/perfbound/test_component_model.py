@@ -58,11 +58,17 @@ def calibration() -> dict:
 
 @pytest.fixture
 def matmul_extract() -> HIVMExtract:
-    """Minimal matmul kernel: Cube + MTE only, no vector."""
+    """Minimal matmul kernel: Cube + MTE only, no vector.
+
+    flops and elements are DISTINCT: flops = 2*M*N*K (FMA count),
+    elements = M*N (output element count).  The component model must
+    consume flops, not elements, for compute work.
+    """
     ops = [
         OpRecord(op_id=1, op_name="matmul", component=Component.CUBE,
                  precision=Precision.FP16, pipe="Cube",
-                 bytes_transferred=0, elements=2 * 128 * 64 * 32,
+                 bytes_transferred=0, elements=128 * 64,
+                 flops=2 * 128 * 64 * 32,
                  duration_cycles=100, loop_multiplier=32, depends_on=[]),
         OpRecord(op_id=2, op_name="cube_load", component=Component.MTE_GM,
                  precision=Precision.FP16, pipe="CubeMTE2",
@@ -74,6 +80,10 @@ def matmul_extract() -> HIVMExtract:
                  bytes_transferred=128 * 64 * 2, elements=0,
                  duration_cycles=50, loop_multiplier=1, depends_on=[1]),
     ]
+    # Regression guard: flops must be distinct from elements (2K ratio)
+    assert ops[0].flops != ops[0].elements, "flops == elements — relabel broken"
+    assert ops[0].flops == 2 * 128 * 64 * 32
+    assert ops[0].elements == 128 * 64
     return HIVMExtract(operations=ops, handoffs=[], unit_assignment={
         op.op_id: op.component.value for op in ops
     })
@@ -81,11 +91,15 @@ def matmul_extract() -> HIVMExtract:
 
 @pytest.fixture
 def matmul_vector_extract() -> HIVMExtract:
-    """MatMul + Vector bias + store: Cube→Vector cross-path."""
+    """MatMul + Vector bias + store: Cube->Vector cross-path.
+
+    flops and elements are DISTINCT for the Cube op.
+    """
     ops = [
         OpRecord(op_id=1, op_name="matmul", component=Component.CUBE,
                  precision=Precision.FP16, pipe="Cube",
-                 bytes_transferred=0, elements=2 * 128 * 64 * 32,
+                 bytes_transferred=0, elements=128 * 64,
+                 flops=2 * 128 * 64 * 32,
                  duration_cycles=100, loop_multiplier=32, depends_on=[]),
         OpRecord(op_id=2, op_name="cube_load", component=Component.MTE_GM,
                  precision=Precision.FP16, pipe="CubeMTE2",
@@ -101,6 +115,8 @@ def matmul_vector_extract() -> HIVMExtract:
                  bytes_transferred=128 * 64 * 2, elements=0,
                  duration_cycles=50, loop_multiplier=1, depends_on=[3]),
     ]
+    # Regression guard
+    assert ops[0].flops != ops[0].elements, "flops == elements — relabel broken"
     return HIVMExtract(operations=ops, handoffs=[
         HandoffRecord(1, 3, Component.CUBE, Component.VECTOR, 128 * 64 * 2,
                       is_mandatory=None),
@@ -417,3 +433,197 @@ class TestIntegration:
         name, frac = result.attribution.dominant_gap()
         assert name == "gap1_wrong_unit", \
             f"Expected dominant gap 'gap1_wrong_unit', got '{name}'"
+
+
+# ── A.4 Acceptance: Attention-Shaped Golden Kernel ───────────────────────────
+
+@pytest.fixture
+def attention_extract() -> HIVMExtract:
+    """FlashAttention-shaped kernel: Cube->Vector->Cube with TWO mandatory edges.
+
+    Pattern: QK^T (Cube) -> softmax (Vector) -> xV (Cube)
+    Two distinct mandatory handoffs: Cube->Vector and Vector->Cube.
+
+    Dimensions per tile: M=128, N=64, K=32, loop_multiplier=32.
+    """
+    ops = [
+        # QK^T matmul
+        OpRecord(op_id=1, op_name="matmul_qk", component=Component.CUBE,
+                 precision=Precision.FP16, pipe="Cube",
+                 bytes_transferred=0, elements=128 * 64,
+                 flops=2 * 128 * 64 * 32,
+                 duration_cycles=100, loop_multiplier=32, depends_on=[]),
+        # Load Q
+        OpRecord(op_id=2, op_name="load_q", component=Component.MTE_GM,
+                 precision=Precision.FP16, pipe="CubeMTE2",
+                 bytes_transferred=128 * 32 * 2, elements=0,
+                 duration_cycles=50, loop_multiplier=32, depends_on=[]),
+        # Load K
+        OpRecord(op_id=3, op_name="load_k", component=Component.MTE_GM,
+                 precision=Precision.FP16, pipe="CubeMTE2",
+                 bytes_transferred=32 * 64 * 2, elements=0,
+                 duration_cycles=50, loop_multiplier=32, depends_on=[]),
+        # Softmax (Vector): ~4 ops per element (sub_max, exp, sum, div)
+        OpRecord(op_id=4, op_name="softmax", component=Component.VECTOR,
+                 precision=Precision.FP16, pipe="Vector",
+                 bytes_transferred=0, elements=128 * 64,
+                 flops=4 * 128 * 64,
+                 duration_cycles=10, loop_multiplier=1, depends_on=[1]),
+        # xV matmul
+        OpRecord(op_id=5, op_name="matmul_v", component=Component.CUBE,
+                 precision=Precision.FP16, pipe="Cube",
+                 bytes_transferred=0, elements=128 * 32,
+                 flops=2 * 128 * 64 * 32,
+                 duration_cycles=100, loop_multiplier=32, depends_on=[4]),
+        # Load V
+        OpRecord(op_id=6, op_name="load_v", component=Component.MTE_GM,
+                 precision=Precision.FP16, pipe="CubeMTE2",
+                 bytes_transferred=64 * 32 * 2, elements=0,
+                 duration_cycles=50, loop_multiplier=32, depends_on=[]),
+        # Store output
+        OpRecord(op_id=7, op_name="store_out", component=Component.MTE_UB,
+                 precision=Precision.FP16, pipe="FixPipe",
+                 bytes_transferred=128 * 32 * 2, elements=0,
+                 duration_cycles=50, loop_multiplier=1, depends_on=[5]),
+    ]
+    # Regression guard
+    assert ops[0].flops != ops[0].elements, "flops == elements — relabel broken"
+
+    handoffs = [
+        # Mandatory: QK^T (Cube) -> softmax (Vector)
+        HandoffRecord(1, 4, Component.CUBE, Component.VECTOR, 128 * 64 * 2,
+                      is_mandatory=None),
+        # Mandatory: softmax (Vector) -> xV (Cube)
+        HandoffRecord(4, 5, Component.VECTOR, Component.CUBE, 128 * 64 * 2,
+                      is_mandatory=None),
+        # Avoidable: load_q (MTE_GM) -> QK^T (Cube) — same-path
+        HandoffRecord(2, 1, Component.MTE_GM, Component.CUBE, 128 * 32 * 2,
+                      is_mandatory=None),
+        # Avoidable: load_k (MTE_GM) -> QK^T (Cube) — same-path
+        HandoffRecord(3, 1, Component.MTE_GM, Component.CUBE, 32 * 64 * 2,
+                      is_mandatory=None),
+        # Avoidable: load_v (MTE_GM) -> xV (Cube) — same-path
+        HandoffRecord(6, 5, Component.MTE_GM, Component.CUBE, 64 * 32 * 2,
+                      is_mandatory=None),
+        # Avoidable: xV (Cube) -> store (MTE_UB) — same-path
+        HandoffRecord(5, 7, Component.CUBE, Component.MTE_UB, 128 * 32 * 2,
+                      is_mandatory=None),
+    ]
+    return HIVMExtract(operations=ops, handoffs=handoffs,
+                       unit_assignment={op.op_id: op.component.value for op in ops})
+
+
+class TestAttentionGolden:
+    """A.4 acceptance: FlashAttention-shaped kernel with hand-computed spreadsheet.
+
+    All intermediates verified to 3 sig figs (pytest.approx rel=1e-3).
+
+    Synthetic calibration: Cube 280 TFLOPS, Vector 18 TFLOPS, MTE 180 GB/s.
+
+    SPREADSHEET:
+    ============
+    Dimensions: M=128, N=64, K=32, loop_mult=32
+
+    Cube work:
+      QK^T: flops=2*128*64*32 * 32 = 16,777,216 FLOPs
+      xV:   flops=2*128*64*32 * 32 = 16,777,216 FLOPs
+      Total Cube: 33,554,432 FLOPs
+      I_cube = 280 TFLOPS = 280,000,000 FLOP/us
+      T_cube = 33,554,432 / 280,000,000 = 0.119837 us
+
+    Vector work:
+      softmax: flops=4*128*64 = 32,768 FLOPs
+      I_vector = 18 TFLOPS = 18,000,000 FLOP/us
+      T_vector = 32,768 / 18,000,000 = 0.001820 us
+
+    MTE_GM work:
+      load_q: 128*32*2 * 32 = 262,144 B
+      load_k: 32*64*2 * 32 = 131,072 B
+      load_v: 64*32*2 * 32 = 131,072 B
+      Total MTE_GM: 524,288 B
+      BW = 180 GB/s = 180,000 B/us
+      T_mte_gm = 524,288 / 180,000 = 2.91271 us  <-- BINDS
+
+    MTE_UB work:
+      store_out: 128*32*2 = 8,192 B
+      T_mte_ub = 8,192 / 180,000 = 0.045511 us
+
+    T_core_floor = max(T_cube, T_vector, T_mte_gm, T_mte_ub)
+                 = max(0.11984, 0.00182, 2.91271, 0.04551)
+                 = 2.91271 us (MTE_GM binds)
+
+    T_serial_irreducible:
+      2 distinct mandatory edges (Cube->Vector, Vector->Cube)
+      each costs: 2000 cycles / 1850 cycles_per_us = 1.08108 us
+      Total: 2 * 1.08108 = 2.16216 us
+    """
+
+    def test_attention_cube_intermediate(self, calibration, attention_extract):
+        """Cube: 33,554,432 FLOPs at 280 TFLOPS = 0.1198 us."""
+        result = compute_component_floor(
+            attention_extract,
+            calibration["cube"], calibration["vector"],
+            calibration["memory"], calibration["core"],
+        )
+        assert result.per_component_us["cube"] == pytest.approx(0.11984, rel=1e-3)
+
+    def test_attention_vector_intermediate(self, calibration, attention_extract):
+        """Vector: 32,768 FLOPs at 18 TFLOPS = 0.00182 us."""
+        result = compute_component_floor(
+            attention_extract,
+            calibration["cube"], calibration["vector"],
+            calibration["memory"], calibration["core"],
+        )
+        assert result.per_component_us["vector"] == pytest.approx(0.001820, rel=1e-3)
+
+    def test_attention_mte_gm_intermediate(self, calibration, attention_extract):
+        """MTE_GM: 524,288 B at 180 GB/s = 2.913 us (binds)."""
+        result = compute_component_floor(
+            attention_extract,
+            calibration["cube"], calibration["vector"],
+            calibration["memory"], calibration["core"],
+        )
+        assert result.per_component_us["mte_gm"] == pytest.approx(2.9127, rel=1e-3)
+
+    def test_attention_t_core_floor(self, calibration, attention_extract):
+        """T_core_floor = max(T_cube, T_vector, T_mte_gm, T_mte_ub) = 2.913 us."""
+        result = compute_component_floor(
+            attention_extract,
+            calibration["cube"], calibration["vector"],
+            calibration["memory"], calibration["core"],
+        )
+        assert result.t_core_floor_us == pytest.approx(2.9127, rel=1e-3)
+        assert result.binding_component == Component.MTE_GM
+
+    def test_attention_two_distinct_mandatory_edges(self, attention_extract):
+        """Two mandatory edges: Cube->Vector and Vector->Cube."""
+        serial = classify_handoffs(
+            attention_extract.handoffs,
+            mandatory_handoff_cycles=2000,
+            clock_ghz=1.85,
+        )
+        mandatory = serial.mandatory_handoffs
+        assert len(mandatory) == 2, \
+            f"Expected 2 mandatory handoffs, got {len(mandatory)}"
+        edges = {(h.producer_component, h.consumer_component) for h in mandatory}
+        assert (Component.CUBE, Component.VECTOR) in edges
+        assert (Component.VECTOR, Component.CUBE) in edges
+
+    def test_attention_t_serial_irreducible(self, attention_extract):
+        """T_serial_irreducible = 2 * (2000/1850) = 2.162 us."""
+        serial = classify_handoffs(
+            attention_extract.handoffs,
+            mandatory_handoff_cycles=2000,
+            clock_ghz=1.85,
+        )
+        expected = 2.0 * (2000.0 / 1850.0)  # 2.16216 us
+        assert serial.t_serial_irreducible_us == pytest.approx(expected, rel=1e-3)
+
+    def test_attention_avoidable_handoffs(self, attention_extract):
+        """MTE_GM->Cube and Cube->MTE_UB are same-path (avoidable)."""
+        serial = classify_handoffs(
+            attention_extract.handoffs,
+            mandatory_handoff_cycles=2000,
+            clock_ghz=1.85,
+        )
+        assert len(serial.avoidable_handoffs) == 4

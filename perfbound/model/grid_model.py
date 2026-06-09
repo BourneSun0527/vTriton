@@ -48,29 +48,31 @@ def compute_grid_floor(
     grid: GridInfo,
     core: CoreConfig,
     i_binding: float,
+    total_work: float,
     is_cube_kernel: bool = True,
 ) -> GridBound:
     """Compute T_grid_floor from Tier 1 grid information.
 
-    The grid floor is the time a single core would take for its share of
-    total work, assuming perfect occupancy and load balance at the grid level.
+    The grid floor is the chip-level lower bound on time:
 
-    T_grid_floor = T_total_work / (n_cores · occupancy · load_balance · I_binding)
+    T_grid_floor = total_work · redundancy / (n_cores · occupancy · load_balance · I_binding)
 
-    where T_total_work is the aggregate work across all programs and
-    I_binding is the hardware throughput at the binding component.
+    total_work is caller-supplied in the SAME units as i_binding:
+      - memory-bound: total_work = Σ bytes, i_binding = BW in B/us
+      - compute-bound: total_work = Σ FLOPs, i_binding = throughput in FLOP/us
 
-    For memory-bound kernels, total_work is bytes (including redundancy),
-    I_binding is sustained BW in B/us.
-    For compute-bound kernels, total_work is FLOPs, I_binding is sustained
-    throughput in FLOP/us.
+    GridInfo.work[p] (tile/element counts) is used for occupancy and
+    load_balance RATIOS (units cancel) but NOT for the absolute numerator —
+    deriving total_work from GridInfo.work would mix units.
 
     Args:
         grid: M2-extracted grid quantities (occupancy, load_balance, work).
         core: Core topology (AIC/AIV counts).
-        i_binding: Hardware throughput at the binding component
-                   (e.g., BW_gm_ub for memory-bound, P_cube for compute-bound).
+        i_binding: Hardware throughput at the binding component.
                    Units: B/us or FLOP/us — must match total_work units.
+        total_work: Aggregate work (bytes or FLOPs) across all programs,
+                    in the same unit as i_binding. Scaled by redundancy
+                    internally.
         is_cube_kernel: If True, use Cube core count (20 AIC); if False,
                         use Vector-only count (40 AIV).
 
@@ -85,10 +87,10 @@ def compute_grid_floor(
     load_balance = grid.load_balance if grid.load_balance > 0 else 1.0
     redundancy = grid.redundancy if grid.redundancy > 0 else 1.0
 
-    # Total work from grid: sum of per-program work, scaled by redundancy
-    total_work = sum(grid.work.values()) * redundancy
-    if total_work <= 0:
-        total_work = 1.0
+    # total_work is caller-supplied (bytes or FLOPs), scaled by redundancy
+    scaled_work = total_work * redundancy
+    if scaled_work <= 0:
+        scaled_work = 1.0
 
     # Effective parallel throughput
     effective_i = n_cores * occupancy * load_balance * i_binding
@@ -96,11 +98,11 @@ def compute_grid_floor(
     if effective_i <= 0:
         t_grid_floor_us = float("inf")
     else:
-        t_grid_floor_us = total_work / effective_i
+        t_grid_floor_us = scaled_work / effective_i
 
     return GridBound(
         t_grid_floor_us=t_grid_floor_us,
-        total_work=total_work,
+        total_work=scaled_work,
         n_cores=n_cores,
         occupancy=occupancy,
         load_balance=load_balance,

@@ -172,17 +172,26 @@ def classify_handoffs(
             h.is_mandatory = False
             avoidable.append(h)
 
-    # Each mandatory handoff costs at minimum the measured handoff cycles
-    # (the chain: L0C→GM + GM→UB).  If multiple mandatory handoffs exist,
-    # we assume they can be overlapped (pipelined) — the irreducible
-    # serialization is max over individual handoff costs, not sum.
+    # T_serial_irreducible = Σ over DISTINCT mandatory edges of min_cost(h).
     #
-    # For conservative bound: use max(min_cost per mandatory handoff),
-    # since handoffs can be pipelined across iterations.
+    # Spec §2.2: distinct edges in a dependency chain are sequential and sum
+    # (e.g. Cube→Vector for QKᵀ→softmax, then Vector→Cube for softmax→×V).
+    # Same edge repeated across loop iterations steady-states to one handoff
+    # latency (pipeline), so we dedup by (producer, consumer) component pair
+    # before summing.
+    #
+    # Soundness note: summing assumes distinct edges form a dependency chain
+    # (sequential). Genuinely independent cross-path handoffs would be
+    # over-counted (summing instead of max), which is unsound for a lower
+    # bound. In practice only Cube↔Vector can be mandatory, and both present
+    # normally implies a round-trip chain (QK→softmax→×V), so this is safe.
     t_serial_mandatory_us = 0.0
     if mandatory and mandatory_handoff_cycles > 0:
-        # If mandatory handoffs are on different paths, take max
-        t_serial_mandatory_us = mandatory_handoff_cycles / cycles_per_us
+        distinct_edges: set[tuple[Component, Component]] = set()
+        for h in mandatory:
+            edge = (h.producer_component, h.consumer_component)
+            distinct_edges.add(edge)
+        t_serial_mandatory_us = len(distinct_edges) * (mandatory_handoff_cycles / cycles_per_us)
     elif mandatory:
         # No calibration — flag but don't fail
         t_serial_mandatory_us = 0.0

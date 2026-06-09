@@ -194,8 +194,12 @@ def compute_component_floor(
         prec = op.precision
 
         if comp in (Component.CUBE, Component.VECTOR, Component.SCALAR):
-            # Work in elements (ops) scaled by loop_multiplier
-            work = float(op.elements) * float(op.loop_multiplier)
+            # Work in FLOPs (preferred) or elements (fallback) scaled by loop_multiplier.
+            # Invariant: work-unit must match the rate-unit. Cube rate is FLOP/us;
+            # Vector fallback rate is also FLOP/us (per-op elements/us path is dead
+            # until op_name is threaded through — do not enable in A.4).
+            work_raw = op.flops if op.flops > 0 else op.elements
+            work = float(work_raw) * float(op.loop_multiplier)
             key = (comp, prec)
             compute_work[key] = compute_work.get(key, 0.0) + work
         elif comp in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
