@@ -12,6 +12,8 @@
 #ifndef ASCENDMODEL_ANALYSIS_HIVMANALYSIS_H
 #define ASCENDMODEL_ANALYSIS_HIVMANALYSIS_H
 
+#include "AscendModel/Analysis/HIVMBottleneckDiagnosis.h"
+#include "AscendModel/Analysis/HIVMPipeEnum.h"
 #include "AscendModel/Analysis/HardwareConfig.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -29,19 +31,6 @@ namespace ascend {
 enum class HIVMSchedulerMode {
   Static,
   DES
-};
-
-enum class HIVMPipe {
-  Unknown,
-  Vector,
-  VectorMTE2,
-  CubeMTE2,
-  MTE3,
-  Scalar,
-  FixPipe,
-  Cube,
-  MTE1,
-  All
 };
 
 struct HIVMOp {
@@ -65,9 +54,9 @@ struct HIVMOp {
   int lineNumber = 0;
   bool isSyncOp = false;
   bool isBarrier = false;
-  std::string srcSpace;  // e.g. "gm", "ub", "l1", "l0a", "l0b", "l0c"
-  std::string dstSpace;  // destination memory space for transfer ops
-  std::string elemType;  // element type: "f16", "bf16", "f32", "i32", etc.
+  std::string srcSpace;
+  std::string dstSpace;
+  std::string elemType;
   std::vector<std::string> readBuffers;
   std::vector<std::string> writeBuffers;
   std::vector<int64_t> readBufferVersions;
@@ -92,6 +81,7 @@ struct HIVMAnalysisReport {
   std::map<HIVMPipe, int64_t> pipeBusyCycles;
   std::map<HIVMPipe, int64_t> weightedPipeCycles;
   std::vector<HIVMOp> operations;
+  HIVMBottleneckReport bottleneckReport;
 
   void print(llvm::raw_ostream &os, const HardwareConfig &config) const;
   void emitPerfettoTrace(llvm::raw_ostream &os,
